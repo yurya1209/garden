@@ -37,6 +37,9 @@ from typing import List, Optional, Tuple
 from core.data_structures import Machine, Job, AMR
 from core.config import global_variable, _peek_next_stage
 from core.path_utils import path_length as _path_length  # 인프라(수정 불필요)
+import heapq
+import math
+from typing import Tuple, List
 
 
 # ════════════════════════════════════════════════════════════════
@@ -68,7 +71,164 @@ def path(a: Tuple[float, float], b: Tuple[float, float]) -> List[Tuple[float, fl
 
     """
     # ════════════ 학생 구현 영역 시작 ════════════
-    return [a, b]
+    """
+    a → b 까지 설비를 우회하는 waypoint 리스트를 반환.
+    반환 형식: [a, w1, w2, ..., b]
+    """
+
+    # 전체 레이아웃 크기
+    X_MIN, X_MAX = 0, 60
+    Y_MIN, Y_MAX = 0, 20
+
+    # 좌표를 격자 좌표로 변환
+    start = (round(a[0]), round(a[1]))
+    goal = (round(b[0]), round(b[1]))
+
+    # -----------------------------
+    # 1. 설비가 차지하는 칸을 장애물로 만들기
+    # -----------------------------
+    obstacles = set()
+
+    for stage in global_variable.MACHINES:
+        for machine in global_variable.MACHINES[stage]:
+
+            # Machine 객체의 좌표 속성 이름이 코드마다 다를 수 있으므로
+            # 가능한 경우를 여러 개 처리
+            if hasattr(machine, "x") and hasattr(machine, "y"):
+                mx, my = machine.x, machine.y
+            elif hasattr(machine, "pos"):
+                mx, my = machine.pos
+            elif hasattr(machine, "position"):
+                mx, my = machine.position
+            else:
+                # 좌표를 못 찾으면 일단 건너뜀
+                continue
+
+            mx = round(mx)
+            my = round(my)
+
+            # 설비 크기: 3m x 2m
+            # 중심이 (mx, my)라고 보고 주변 칸을 막음
+            # 약간 넉넉하게 y 방향도 my-1 ~ my+1까지 막아서
+            # AMR이 설비를 스치며 통과하는 문제를 줄임
+            for x in range(mx - 1, mx + 2):
+                for y in range(my - 1, my + 2):
+                    obstacles.add((x, y))
+
+    # 시작점과 도착점은 포트 좌표일 수 있으므로 장애물에서 제외
+    obstacles.discard(start)
+    obstacles.discard(goal)
+
+    # -----------------------------
+    # 2. 격자 내부인지, 이동 가능한 칸인지 확인
+    # -----------------------------
+    def is_valid(node):
+        x, y = node
+        if x < X_MIN or x > X_MAX:
+            return False
+        if y < Y_MIN or y > Y_MAX:
+            return False
+        if node in obstacles:
+            return False
+        return True
+
+    # 상하좌우 이동
+    directions = [
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1)
+    ]
+
+    # -----------------------------
+    # 3. Dijkstra 알고리즘
+    # -----------------------------
+    INF = float("inf")
+
+    dist_table = {}
+    prev = {}
+
+    dist_table[start] = 0
+
+    heap = []
+    heapq.heappush(heap, (0, start))
+
+    visited = set()
+
+    while heap:
+        current_dist, current = heapq.heappop(heap)
+
+        if current in visited:
+            continue
+
+        visited.add(current)
+
+        if current == goal:
+            break
+
+        for dx, dy in directions:
+            nxt = (current[0] + dx, current[1] + dy)
+
+            if not is_valid(nxt):
+                continue
+
+            new_dist = current_dist + 1
+
+            if new_dist < dist_table.get(nxt, INF):
+                dist_table[nxt] = new_dist
+                prev[nxt] = current
+                heapq.heappush(heap, (new_dist, nxt))
+
+    # -----------------------------
+    # 4. 경로 복원
+    # -----------------------------
+    if goal not in dist_table:
+        # 경로를 못 찾은 경우 시뮬레이션이 멈추지 않도록 직선 경로 반환
+        # 하지만 정상이라면 여기로 오면 안 됨
+        return [a, b]
+
+    grid_path = []
+    cur = goal
+
+    while cur != start:
+        grid_path.append(cur)
+        cur = prev[cur]
+
+    grid_path.append(start)
+    grid_path.reverse()
+
+    # -----------------------------
+    # 5. 불필요한 중간점 줄이기
+    #    같은 방향으로 계속 가는 점들은 제거해서
+    #    waypoint가 너무 길어지는 것을 방지
+    # -----------------------------
+    compressed = []
+
+    for p in grid_path:
+        if len(compressed) < 2:
+            compressed.append(p)
+        else:
+            p1 = compressed[-2]
+            p2 = compressed[-1]
+            p3 = p
+
+            dir1 = (p2[0] - p1[0], p2[1] - p1[1])
+            dir2 = (p3[0] - p2[0], p3[1] - p2[1])
+
+            if dir1 == dir2:
+                compressed[-1] = p3
+            else:
+                compressed.append(p3)
+
+    # 시작과 끝은 입력 좌표 그대로 유지해야 함
+    result = [a]
+
+    for p in compressed[1:-1]:
+        result.append((float(p[0]), float(p[1])))
+
+    result.append(b)
+
+    return result
     # ════════════ 학생 구현 영역 끝   ════════════
 
 
