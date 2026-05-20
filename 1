@@ -1,0 +1,473 @@
+"""
+
+이 파일의 함수들을 수정하여 프로젝트를 완성하세요.
+시뮬레이션 인프라(이벤트 콜백, AMR 예약, 설비 상태 머신 등)는
+core/scheduling.py 에 있으며 해당 파일을 수정을 해야 한다면, 꼭 수정한 부분과 이유를 주석으로 명확히 언급해주세요.
+
+──────────────────────────────────────────────────────────────
+과업 ↔ 함수 매핑
+──────────────────────────────────────────────────────────────
+  과업 ①  AMR 이동 경로 (Dijkstra)
+      └─ path(), dist()
+
+  과업 ②  스테이션 선택 정책
+      ├─ select_next_machine()        — 다음 단계 설비 선택 (push)
+      └─ select_upstream_source()     — 이전 스테이션의 후보 주문 선택 (pull)
+
+  과업 ③  주문 투입 우선순위 정책
+      └─ decide_next_order_type()     — Warehouse에 새로 만들 주문 유형
+
+   AMR 배차 정책
+      └─ select_amr()                 — 어느 AMR에 task를 배차할지
+
+──────────────────────────────────────────────────────────────
+사용 가능한 전역 상태 (core.config.global_variable)
+──────────────────────────────────────────────────────────────
+  global_variable.now                 시뮬레이션 현재 시각(초)
+  global_variable.MACHINES            Dict[stage, List[Machine]]
+  global_variable.AMRS                List[AMR]
+  global_variable.WAREHOUSE           Warehouse 인스턴스
+  global_variable.ROUND_ROBIN_IDX     Dict[stage, int]   (라운드로빈 카운터)
+  global_variable.FEED_SEQ            현재 시나리오의 feed_sequence
+  global_variable.FEED_IDX            feed_sequence 인덱스 카운터
+  global_variable.CURRENT_CFG         FactoryConfig 인스턴스
+"""
+
+import heapq
+import math
+from typing import Dict, List, Optional, Tuple
+from core.data_structures import Machine, Job, AMR
+from core.config import global_variable, _peek_next_stage
+from core.path_utils import path_length as _path_length  # 인프라(수정 불필요)
+
+
+XY = Tuple[float, float]
+Grid = Tuple[int, int]
+Rect = Tuple[float, float, float, float]  # left, right, bottom, top
+Graph = Dict[Grid, List[Tuple[Grid, float]]]
+
+GRID_X_MIN, GRID_X_MAX = 0, 60
+GRID_Y_MIN, GRID_Y_MAX = 0, 20
+MACHINE_HALF_WIDTH = 2.0
+MACHINE_HALF_HEIGHT = 1.0
+MACHINE_CLEARANCE = 0.25
+EPS = 1e-9
+ORDER_TYPE_ALIASES = {
+    "Str": "Std",
+    "STD": "Std",
+    "std": "Std",
+    "EXP": "Exp",
+    "exp": "Exp",
+    "CLD": "Cld",
+    "cld": "Cld",
+}
+_GRAPH_CACHE: Dict[Tuple[Tuple[Rect, ...], Tuple[int, int, int, int]], Graph] = {}
+
+
+def _normalize_order_type(order_type: str) -> str:
+    return ORDER_TYPE_ALIASES.get(order_type, order_type)
+
+
+def _machine_rectangles(clearance: float = 0.0) -> List[Rect]:
+    """Return obstacle rectangles that match the boxes drawn in visualization.py."""
+    rects: List[Rect] = []
+    for machines in global_variable.MACHINES.values():
+        for m in machines:
+            x, y = m.xy
+            rects.append((
+                float(x) - MACHINE_HALF_WIDTH - clearance,
+                float(x) + MACHINE_HALF_WIDTH + clearance,
+                float(y) - MACHINE_HALF_HEIGHT - clearance,
+                float(y) + MACHINE_HALF_HEIGHT + clearance,
+            ))
+    return rects
+
+
+def _grid_bounds(a: XY, b: XY, rects: List[Rect]) -> Tuple[int, int, int, int]:
+    xs = [GRID_X_MIN, GRID_X_MAX, a[0], b[0]]
+    ys = [GRID_Y_MIN, GRID_Y_MAX, a[1], b[1]]
+    return (
+        math.floor(min(xs)),
+        math.ceil(max(xs)),
+        math.floor(min(ys)),
+        math.ceil(max(ys)),
+    )
+
+
+def _inside_rect_interior(p: XY, rect: Rect) -> bool:
+    left, right, bottom, top = rect
+    x, y = p
+    return left + EPS < x < right - EPS and bottom + EPS < y < top - EPS
+
+
+def _blocked_node(node: Grid, rects: List[Rect]) -> bool:
+    return any(_inside_rect_interior(node, rect) for rect in rects)
+
+
+def _segment_crosses_rect_interior(p0: XY, p1: XY, rect: Rect) -> bool:
+    """Liang-Barsky test against a slightly shrunken rectangle interior."""
+    left, right, bottom, top = rect
+    left += EPS
+    right -= EPS
+    bottom += EPS
+    top -= EPS
+    if left >= right or bottom >= top:
+        return False
+
+    x0, y0 = p0
+    x1, y1 = p1
+    dx = x1 - x0
+    dy = y1 - y0
+    u1, u2 = 0.0, 1.0
+
+    for p, q in (
+        (-dx, x0 - left),
+        ( dx, right - x0),
+        (-dy, y0 - bottom),
+        ( dy, top - y0),
+    ):
+        if abs(p) <= EPS:
+            if q < 0.0:
+                return False
+            continue
+        r = q / p
+        if p < 0.0:
+            if r > u2:
+                return False
+            if r > u1:
+                u1 = r
+        else:
+            if r < u1:
+                return False
+            if r < u2:
+                u2 = r
+    return u1 <= u2 and u2 >= 0.0 and u1 <= 1.0
+
+
+def _clear_segment(p0: XY, p1: XY, rects: List[Rect]) -> bool:
+    return not any(_segment_crosses_rect_interior(p0, p1, rect) for rect in rects)
+
+
+def _snap_to_grid(
+    p: XY,
+    blocked_rects: List[Rect],
+    segment_rects: List[Rect],
+    bounds: Tuple[int, int, int, int],
+    prefer: Optional[XY] = None,
+) -> Grid:
+    min_x, max_x, min_y, max_y = bounds
+    base_x = int(round(p[0]))
+    base_y = int(round(p[1]))
+
+    best: Optional[Tuple[float, float, Grid]] = None
+    max_radius = max(max_x - min_x, max_y - min_y)
+    min_search_radius = 0
+    if not (
+        math.isclose(p[0], round(p[0]), abs_tol=EPS)
+        and math.isclose(p[1], round(p[1]), abs_tol=EPS)
+    ):
+        min_search_radius = 1
+    for radius in range(max_radius + 1):
+        for x in range(max(min_x, base_x - radius), min(max_x, base_x + radius) + 1):
+            for y in range(max(min_y, base_y - radius), min(max_y, base_y + radius) + 1):
+                node = (x, y)
+                if _blocked_node(node, blocked_rects):
+                    continue
+                if not _clear_segment(p, node, segment_rects):
+                    continue
+                score = math.hypot(p[0] - x, p[1] - y)
+                prefer_score = 0.0
+                if prefer is not None:
+                    prefer_score = math.hypot(prefer[0] - x, prefer[1] - y)
+                candidate = (score, prefer_score, node)
+                if best is None or candidate < best:
+                    best = candidate
+        if best is not None and radius >= min_search_radius:
+            return best[2]
+    raise RuntimeError(f"No free grid node near {p}.")
+
+
+def _neighbors(node: Grid, rects: List[Rect], bounds: Tuple[int, int, int, int]) -> List[Tuple[Grid, float]]:
+    min_x, max_x, min_y, max_y = bounds
+    x, y = node
+    result: List[Tuple[Grid, float]] = []
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        nxt = (x + dx, y + dy)
+        if not (min_x <= nxt[0] <= max_x and min_y <= nxt[1] <= max_y):
+            continue
+        if _blocked_node(nxt, rects):
+            continue
+        if not _clear_segment(node, nxt, rects):
+            continue
+        result.append((nxt, 1.0))
+    return result
+
+
+def _neighbor_graph(rects: List[Rect], bounds: Tuple[int, int, int, int]) -> Graph:
+    key = (tuple(rects), bounds)
+    cached = _GRAPH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    min_x, max_x, min_y, max_y = bounds
+    graph: Graph = {}
+    for x in range(min_x, max_x + 1):
+        for y in range(min_y, max_y + 1):
+            node = (x, y)
+            if _blocked_node(node, rects):
+                continue
+            graph[node] = _neighbors(node, rects, bounds)
+
+    _GRAPH_CACHE[key] = graph
+    return graph
+
+
+def _dijkstra(start: Grid, goal: Grid, rects: List[Rect], bounds: Tuple[int, int, int, int]) -> List[Grid]:
+    graph = _neighbor_graph(rects, bounds)
+    pq: List[Tuple[float, Grid]] = [(0.0, start)]
+    best: Dict[Grid, float] = {start: 0.0}
+    parent: Dict[Grid, Optional[Grid]] = {start: None}
+
+    while pq:
+        cost, node = heapq.heappop(pq)
+        if cost != best.get(node):
+            continue
+        if node == goal:
+            break
+
+        for nxt, step_cost in graph.get(node, []):
+            new_cost = cost + step_cost
+            if new_cost < best.get(nxt, float("inf")):
+                best[nxt] = new_cost
+                parent[nxt] = node
+                heapq.heappush(pq, (new_cost, nxt))
+
+    if goal not in parent:
+        raise RuntimeError(f"No obstacle-free path from {start} to {goal}.")
+
+    rev: List[Grid] = []
+    cur: Optional[Grid] = goal
+    while cur is not None:
+        rev.append(cur)
+        cur = parent[cur]
+    rev.reverse()
+    return rev
+
+
+def _compress_collinear(nodes: List[Grid]) -> List[XY]:
+    if len(nodes) <= 2:
+        return [(float(x), float(y)) for x, y in nodes]
+
+    compressed: List[Grid] = [nodes[0]]
+    for i in range(1, len(nodes) - 1):
+        prev_node = nodes[i - 1]
+        cur_node = nodes[i]
+        next_node = nodes[i + 1]
+        prev_dir = (cur_node[0] - prev_node[0], cur_node[1] - prev_node[1])
+        next_dir = (next_node[0] - cur_node[0], next_node[1] - cur_node[1])
+        if prev_dir != next_dir:
+            compressed.append(cur_node)
+    compressed.append(nodes[-1])
+    return [(float(x), float(y)) for x, y in compressed]
+
+
+def _same_xy(a: XY, b: XY) -> bool:
+    return math.isclose(a[0], b[0], abs_tol=EPS) and math.isclose(a[1], b[1], abs_tol=EPS)
+
+
+# ════════════════════════════════════════════════════════════════
+#  과업 ①  AMR 이동 경로 — Dijkstra 알고리즘 적용
+# ════════════════════════════════════════════════════════════════
+
+def path(a: Tuple[float, float], b: Tuple[float, float]) -> List[Tuple[float, float]]:
+    """
+    현재 구현 : 
+      Dijkstra 미구현 — 단순 직선 이동.
+      → AMR이 설비를 통과하는 비현실적 경로가 나옴.
+      아래 "구현 영역" 안을 Dijkstra 로 교체할 것.
+
+    a → b 까지 설비를 우회하는 waypoint 리스트를 반환.
+
+    반환 형식
+      [a, w1, w2, ..., b]   ← 시작·끝은 입력 좌표 그대로
+
+    가용 정보
+      - global_variable.MACHINES : Dict[stage, List[Machine]]
+        · 각 머신의 중심 좌표와 점유 셀 범위를 잘 보고 통행 가능한 범위를 파악할 것
+
+
+    이 함수가 자동으로 영향을 미치는 곳
+      ① dist(a, b)  → ETA·KPI(makespan)
+      ② amr_runs 로그 → 시뮬레이션 종료 후 애니메이션이
+                       waypoint 를 따라 AMR 의 경로를 그림 (성공적으로 수정 시 우회가 가시적으로 보임)
+      
+
+    """
+    # ════════════ 학생 구현 영역 시작 ════════════
+    start_xy = (float(a[0]), float(a[1]))
+    goal_xy = (float(b[0]), float(b[1]))
+
+    physical_rects = _machine_rectangles()
+    blocked_rects = _machine_rectangles(clearance=MACHINE_CLEARANCE)
+    bounds = _grid_bounds(start_xy, goal_xy, blocked_rects)
+    start = _snap_to_grid(start_xy, blocked_rects, physical_rects, bounds, prefer=goal_xy)
+    goal = _snap_to_grid(goal_xy, blocked_rects, physical_rects, bounds, prefer=start_xy)
+    grid_route = _dijkstra(start, goal, blocked_rects, bounds)
+    route = _compress_collinear(grid_route)
+
+    result: List[XY] = []
+    if not _same_xy(start_xy, route[0]):
+        result.append(start_xy)
+    result.extend(route)
+    if not _same_xy(result[-1], goal_xy):
+        result.append(goal_xy)
+    return result
+    # ════════════ 학생 구현 영역 끝   ════════════
+
+
+def dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    """
+    두 점 사이의 이동 거리(시간 환산용) — path(a,b) 의 누적 호 길이.
+
+
+    호출처: reserve_amr / _predict_eta_for_pick / select_amr /
+            select_upstream_source('nearby') / select_next_machine 힌트.
+    """
+    return _path_length(a, b)
+
+
+# ════════════════════════════════════════════════════════════════
+#  과업 ②-1  다음 단계 설비 선택
+# ════════════════════════════════════════════════════════════════
+
+def select_next_machine(stage: str, candidates: List[Machine]) -> Machine:
+    """
+    다음 단계 설비 선택 정책 개선:
+    - R → P → K → D 순서 강제
+    - 단순 라운드로빈 대신 SLA 기반 선택 가능
+    """
+    # 후보 중에서 현재 stage와 일치하는 설비만 필터링
+    valid_cands = [m for m in candidates if m.stage == stage]
+    if not valid_cands:
+        # fallback: 기존 라운드로빈
+        rr = global_variable.ROUND_ROBIN_IDX.get(stage, 0)
+        drop_m = candidates[rr % len(candidates)]
+        global_variable.ROUND_ROBIN_IDX[stage] = rr + 1
+        return drop_m
+
+    # 라운드로빈 유지 (필터링된 후보만)
+    rr = global_variable.ROUND_ROBIN_IDX.get(stage, 0)
+    drop_m = valid_cands[rr % len(valid_cands)]
+    global_variable.ROUND_ROBIN_IDX[stage] = rr + 1
+    return drop_m
+
+
+
+# ════════════════════════════════════════════════════════════════
+#  과업 ②-2  이전 스테이션의 후보 주문 선택 (Pull)
+# ════════════════════════════════════════════════════════════════
+
+def select_upstream_source(prev_machines: List[Machine],
+                           drop_xy: Tuple[float, float],
+                           target_stage: Optional[str] = None) -> Optional[Tuple[Machine, Job]]:
+    """
+    이전 스테이션 후보 선택 정책 개선:
+    - job의 다음 stage가 target_stage와 정확히 일치하는 경우만 허용
+    - 단순 거리 기준 → 순서 + 거리
+    """
+    cands = []
+    for m in prev_machines:
+        job = m.output_buf
+        if job is None or job.reserved or job.in_transit:
+            continue
+
+        # 순서 강제
+        if target_stage is not None:
+            if _peek_next_stage(job, m.stage) != target_stage:
+                continue
+
+        pick_xy = m.output_port
+        score   = dist(pick_xy, drop_xy)
+        cands.append((score, m, job))
+
+    if not cands:
+        return None
+
+    # 거리 + job_id + machine name 기준 정렬
+    cands.sort(key=lambda x: (x[0], getattr(x[2], "job_id", ""), x[1].name))
+    _, src_m, job = cands[0]
+    return src_m, job
+
+
+
+# ════════════════════════════════════════════════════════════════
+#  과업 ③  주문 투입 우선순위 정책
+# ════════════════════════════════════════════════════════════════
+
+def decide_next_order_type() -> str:
+    """
+    Warehouse에 새 주문을 생성할 때 어떤 유형(Std/Exp/Cld)을 만들지 결정.
+
+    ▶ 현재: feed_sequence를 순환하며 정해진 순서대로 투입 (정적).
+       I 스테이션이 비어있어도 Std만 계속 투입 → I 낭비.
+
+
+    ▶ 제약 (가이드라인)
+      - 시나리오 비율 자체는 변경 불가
+      - 전체 시뮬레이션 종료 시점에 실제 투입 비율이 시나리오 비율 ±3% 이내
+    """
+    if not global_variable.FEED_SEQ:
+        return "Std"
+    seq = global_variable.FEED_SEQ
+    idx = global_variable.FEED_IDX % len(seq)
+    global_variable.FEED_IDX += 1
+    return _normalize_order_type(seq[idx])
+
+
+# ════════════════════════════════════════════════════════════════
+#  AMR 배차 정책
+# ════════════════════════════════════════════════════════════════
+
+def select_amr(
+    amrs: List[AMR],
+    pick_xy: Tuple[float, float],
+    drop_xy: Tuple[float, float],
+    request_time: float,
+    load_sec: float,
+    unload_sec: float,
+    job_id: Optional[str] = None,
+) -> AMR:
+    """
+    여러 AMR 중 어느 로봇에 이 task(pick → drop)를 배차할지 결정.
+    선택만 책임지며, free_time / planned_xy 같은 상태 업데이트와
+    콜백 등록은 core/scheduling.py 의 reserve_amr 가 처리한다.
+
+    ▶ 현재: depart_drop(=ETA) 최소 AMR 선택.
+       시뮬레이션 끝나는 시각이 가장 빠른 AMR 1대.
+
+    주의
+      - 반환값이 None이거나 amrs에 없는 AMR이면 시뮬레이션이 깨진다.
+      - amr.free_time / amr.planned_xy 는 절대 직접 수정하지 말 것.
+        (해당 상태 업데이트는 reserve_amr가 책임)
+    """
+    best, best_eta = amrs[0], float("inf")
+    for a in amrs:
+        depart_at    = max(request_time, a.free_time)
+        future_start = (
+            a.planned_xy
+            if (a.planned_xy is not None and a.free_time > request_time)
+            else a.xy
+        )
+        t_pick = dist(future_start, pick_xy) / max(a.speed, 1e-9)
+        t_drop = dist(pick_xy, drop_xy)      / max(a.speed, 1e-9)
+        eta    = depart_at + t_pick + load_sec + t_drop + unload_sec
+        if eta < best_eta:
+            best, best_eta = a, eta
+    return best
+
+
+
+"""
+이쪽에 위의 함수들 외에도 추가적인 기능을 하는 함수들을 자유롭게 구현해도 좋습니다. 
+다만, core/scheduling.py 의 이벤트 콜백과 같이 시뮬레이션의 뼈대를 담당하는 함수들을 수정해야 한다면, 꼭 수정한 부분과 이유를 주석으로 명확히 언급해주세요.
+"""
